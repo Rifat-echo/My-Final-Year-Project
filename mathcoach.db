@@ -1,0 +1,239 @@
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+import joblib
+import pandas as pd
+import shap
+
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+
+from passlib.context import CryptContext
+
+from db import engine, get_db
+from models_db import Base, Prediction, User
+
+
+# -------------------------
+# App + CORS
+# -------------------------
+app = FastAPI(title="Math Performance Coach API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],  # Vite frontend
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+def startup():
+    Base.metadata.create_all(bind=engine)
+
+
+# -------------------------
+# Password hashing (bcrypt)
+# -------------------------
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_pw(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_pw(password: str, hashed: str) -> bool:
+    return pwd_context.verify(password, hashed)
+
+
+# -------------------------
+# Load model + SHAP
+# -------------------------
+model = joblib.load("models/rf_model.pkl")
+background = pd.read_csv("models/background.csv")
+explainer = shap.TreeExplainer(model, background)
+
+FEATURES = ["studytime", "failures", "absences", "G1", "G2"]
+
+
+# -------------------------
+# Schemas
+# -------------------------
+class PredictRequest(BaseModel):
+    studytime: int
+    failures: int
+    absences: int
+    G1: int
+    G2: int
+
+class AuthRequest(BaseModel):
+    username: str
+    password: str
+
+
+# -------------------------
+# Helpers for feedback
+# -------------------------
+FEATURE_LABELS = {
+    "studytime": "Study time",
+    "failures": "Past failures",
+    "absences": "Absences",
+    "G1": "First test grade (G1)",
+    "G2": "Second test grade (G2)",
+}
+
+# “Improve” direction (not hardcoded “good/bad” — just a realistic tweak to test)
+STEP = {
+    "studytime": +1,   # move one level up (1–4)
+    "failures": -1,    # reduce by 1 (0–4)
+    "absences": -5,    # reduce by 5 (0–93)
+    "G1": +1,          # +1 grade point
+    "G2": +1,          # +1 grade point
+}
+
+BOUNDS = {
+    "studytime": (1, 4),
+    "failures": (0, 4),
+    "absences": (0, 93),
+    "G1": (0, 20),
+    "G2": (0, 20),
+}
+
+TIPS = {
+    "studytime": "Try making a small weekly routine: 30–45 minutes a day beats cramming.",
+    "failures": "Pick one weak topic and practice 10–15 questions on it before moving on.",
+    "absences": "Aim to attend the next few lessons consistently and catch up the ones you missed.",
+    "G1": "Review the early chapters again and redo your first-test mistakes.",
+    "G2": "Focus revision on topics that appear most often in the second test and do past questions.",
+}
+
+def clamp(x: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, x))
+
+def counterfactual_delta(df: pd.DataFrame, feat: str) -> tuple[float, int]:
+    """
+    Returns (delta_prediction, new_value) after applying an improvement step on feat.
+    delta_prediction > 0 means prediction improves when you 'improve' that feature.
+    """
+    original_pred = float(model.predict(df)[0])
+
+    lo, hi = BOUNDS[feat]
+    current_val = int(df.loc[0, feat])
+    new_val = clamp(current_val + STEP[feat], lo, hi)
+
+    df2 = df.copy()
+    df2.loc[0, feat] = new_val
+    new_pred = float(model.predict(df2)[0])
+
+    return (new_pred - original_pred), new_val
+
+
+# -------------------------
+# Routes
+# -------------------------
+@app.get("/")
+def root():
+    return {"status": "API is running"}
+
+
+@app.post("/register")
+def register(req: AuthRequest, db: Session = Depends(get_db)):
+    user = User(username=req.username, password=hash_pw(req.password))
+    db.add(user)
+
+    try:
+        db.commit()
+        db.refresh(user)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+    return {"message": "User registered successfully", "user_id": user.id}
+
+
+@app.post("/login")
+def login(req: AuthRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == req.username).first()
+
+    if not user or not verify_pw(req.password, user.password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    return {
+        "access_token": str(user.id),
+        "token_type": "bearer",
+        "user_id": user.id,
+        "message": "Login successful"
+    }
+
+
+@app.post("/predict")
+def predict(req: PredictRequest, db: Session = Depends(get_db)):
+    # 1) Build input
+    row = {
+        "studytime": req.studytime,
+        "failures": req.failures,
+        "absences": req.absences,
+        "G1": req.G1,
+        "G2": req.G2
+    }
+    df = pd.DataFrame([row])[FEATURES]
+
+    # 2) Predict
+    pred = float(model.predict(df)[0])
+
+    # 3) SHAP: pick most influential features (importance only)
+    shap_values = explainer.shap_values(df)
+    contrib = pd.Series(shap_values[0], index=df.columns)
+    top_feats = contrib.abs().sort_values(ascending=False).head(3).index.tolist()
+
+    # 4) Human-readable, model-driven feedback using counterfactual deltas
+    feedback = []
+    for feat in top_feats:
+        label = FEATURE_LABELS.get(feat, feat)
+        current_val = df.loc[0, feat]
+
+        delta, new_val = counterfactual_delta(df, feat)
+
+        # If improving helps, explain it. If it doesn’t, say it’s not the main lever right now.
+        if abs(delta) < 0.05:
+            msg = (
+                f"{label} matters for your result, but changing it slightly "
+                f"(from {current_val} to {new_val}) does not change the prediction much right now."
+            )
+        elif delta > 0:
+            msg = (
+                f"Improving {label} (from {current_val} to {new_val}) could increase your predicted grade "
+                f"by about {delta:.2f} points."
+            )
+        else:
+            # This can happen if the model learned something weird.
+            # We report it clearly instead of pretending it's always good/bad.
+            msg = (
+                f"Changing {label} (from {current_val} to {new_val}) would decrease the predicted grade "
+                f"by about {abs(delta):.2f} points in this model."
+            )
+
+        tip = TIPS.get(feat)
+        if tip:
+            msg = msg + " " + tip
+
+        feedback.append(msg)
+
+    # 5) Save prediction
+    record = Prediction(
+        user_id=None,
+        studytime=req.studytime,
+        failures=req.failures,
+        absences=req.absences,
+        G1=req.G1,
+        G2=req.G2,
+        prediction=pred
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+
+    return {
+        "prediction": round(pred, 2),
+        "feedback": feedback,
+        "saved_id": record.id
+    }

@@ -1,0 +1,1 @@
+["studytime", "failures", "absences", "G1", "G2"]

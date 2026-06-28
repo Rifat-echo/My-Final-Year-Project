@@ -1,0 +1,12 @@
+$ErrorActionPreference = "Stop"
+
+$backendDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repoRoot = Split-Path -Parent $backendDir
+$pythonExe = Join-Path $repoRoot "venv\Scripts\python.exe"
+
+if (-not (Test-Path $pythonExe)) {
+    throw "Virtual environment Python not found at $pythonExe"
+}
+
+Set-Location $backendDir
+& $pythonExe -m uvicorn main:app --reload --port 8001
